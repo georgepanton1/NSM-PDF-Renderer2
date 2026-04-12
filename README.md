@@ -54,15 +54,30 @@ Renders an HTML page (loaded from a URL) to PDF and uploads the result to S3.
 ```json
 {
   "url": "https://your-s3-bucket.com/path/to/file.html",
-  "storageUploadUrl": "https://storage-api.example.com/upload/path/to/output.pdf",
+  "storageUploadUrl": "https://storage-api.example.com/v1/storage/upload?path=nsm-pdfs/output.pdf",
   "storageApiKey": "bearer-token-for-storage-api",
   "options": {
     "timeoutMs": 300000,
+    "autoDetect": true,
     "paperFormat": "A4",
-    "scale": 1
+    "scale": 1,
+    "viewportWidth": 1280,
+    "margins": { "top": "10mm", "right": "10mm", "bottom": "10mm", "left": "10mm" }
   }
 }
 ```
+
+**Options:**
+| Option | Default | Description |
+|--------|---------|-------------|
+| `timeoutMs` | 300000 | Navigation + render timeout in ms |
+| `autoDetect` | true | Auto-detect paper size from HTML content |
+| `paperFormat` | (auto) | Force paper format: A4, A3, Letter, Legal, Tabloid |
+| `paperWidth` | null | Explicit width in inches (overrides format) |
+| `paperHeight` | null | Explicit height in inches (overrides format) |
+| `scale` | (auto) | PDF scale factor (0.3–1.0) |
+| `viewportWidth` | 1280 | Browser viewport width in px |
+| `margins` | 10mm all | Page margins in CSS units |
 
 **Response:**
 ```json
@@ -73,9 +88,28 @@ Renders an HTML page (loaded from a URL) to PDF and uploads the result to S3.
   "renderTimeMs": 45000,
   "pageCount": 120,
   "queueTimeMs": 0,
-  "renderPath": "server-side-puppeteer"
+  "renderPath": "server-side-puppeteer",
+  "usedFallback": false,
+  "sizingMeta": {
+    "firstPageCssWidth": 794,
+    "firstPageCssHeight": 1123,
+    "inferredDpi": 96,
+    "appliedScale": 1,
+    "finalPdfWidthPt": 595,
+    "finalPdfHeightPt": 842,
+    "sizingMatchedPaper": "A4"
+  }
 }
 ```
+
+**S3 Upload:** Uses POST + multipart/form-data (matching the Forge storage API format).
+
+**printToPDF Fallback:** If Puppeteer's `page.pdf()` crashes on very large files (60MB+), the renderer automatically tries:
+1. Retry with reduced scale (0.5)
+2. Retry with minimal A4 settings (scale 0.4)
+3. Screenshot-based PDF as last resort
+
+When a fallback is used, `usedFallback: true` and `sizingMeta.sizingMatchedPaper` indicates which fallback (e.g., "A4-fallback", "screenshot-fallback").
 
 ### GET /health
 
@@ -110,10 +144,13 @@ NSM Server (Manus)                    PDF Renderer (Railway/Fly.io)
 │  File > 50MB?  ─┼──────────────────►│  Puppeteer + Chromium│
 │  Yes → call     │  {url, upload...} │  (2GB+ RAM, no limit)│
 │  renderer       │                   │                      │
-│                  │◄──────────────────┤  Renders PDF         │
-│  No → Worker    │  {pdfUrl, ...}    │  Uploads to S3       │
-│  (existing)     │                   │                      │
+│  Worker failed? ─┤                   │  Auto-detect sizing  │
+│  Yes → fallback │                   │  A4/A3/Letter/Legal  │
+│  to renderer    │◄──────────────────┤  Tabloid/custom      │
+│                  │  {pdfUrl, ...}    │                      │
+│  No → Worker    │                   │  printToPDF fallback  │
+│  (existing)     │                   │  for 60MB+ files     │
 └─────────────────┘                   └──────────────────────┘
 ```
 
-The renderer receives the S3 HTML URL (already uploaded by the Worker's proxy-download step), renders it with Puppeteer, and uploads the PDF to S3 using the same storage API as the Worker. The NSM server treats the response identically to a Worker response.
+The renderer receives the S3 HTML URL (already uploaded by the Worker's proxy-download step or the server's direct download fallback), renders it with Puppeteer, and uploads the PDF to S3 using the same storage API as the Worker. The NSM server treats the response identically to a Worker response.
