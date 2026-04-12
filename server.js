@@ -328,6 +328,7 @@ async function renderHtmlToPdf(s3HtmlUrl, options = {}) {
             top: 0 !important;
             margin: 0 auto !important;
             overflow: visible !important;
+            display: block !important;
           }
 
           /* Hide sidebar/navigation elements that pdf2htmlEX adds */
@@ -335,15 +336,12 @@ async function renderHtmlToPdf(s3HtmlUrl, options = {}) {
             display: none !important;
           }
 
-          /* Ensure body has proper dimensions */
-          body {
+          /* Ensure body and html have proper dimensions */
+          html, body {
             overflow: visible !important;
             height: auto !important;
             width: auto !important;
-          }
-
-          html {
-            overflow: visible !important;
+            min-height: 100vh !important;
           }
 
           /* Each page should break properly for printing */
@@ -353,10 +351,17 @@ async function renderHtmlToPdf(s3HtmlUrl, options = {}) {
             page-break-after: always !important;
             page-break-inside: avoid !important;
             margin: 0 auto !important;
+            display: block !important;
           }
 
           /* Remove any transforms that might hide content */
           .pc {
+            position: relative !important;
+          }
+
+          /* Force ALL absolutely-positioned direct children of body into flow */
+          body > div[style*="position: absolute"],
+          body > div[style*="position:absolute"] {
             position: relative !important;
           }
 
@@ -372,17 +377,80 @@ async function renderHtmlToPdf(s3HtmlUrl, options = {}) {
           }
         `;
         document.head.appendChild(style);
+
+        // Also force inline styles on key elements (CSS !important may not
+        // override inline styles in all browsers)
+        const pc = document.getElementById('page-container');
+        if (pc) {
+          pc.style.setProperty('position', 'relative', 'important');
+          pc.style.setProperty('left', '0', 'important');
+          pc.style.setProperty('top', '0', 'important');
+          pc.style.setProperty('overflow', 'visible', 'important');
+        }
+        document.querySelectorAll('.pf').forEach(el => {
+          el.style.setProperty('position', 'relative', 'important');
+          el.style.setProperty('overflow', 'visible', 'important');
+        });
       });
 
       // Wait for layout to settle after CSS injection
-      await new Promise((r) => setTimeout(r, 1000));
+      await new Promise((r) => setTimeout(r, 1500));
+
+      // Force reflow
+      await page.evaluate(() => {
+        void document.body.offsetHeight;
+        void document.documentElement.offsetHeight;
+      });
 
       // Verify content is now visible
       const postFixHeight = await page.evaluate(() => document.body.scrollHeight);
       console.log(`[Render] After CSS injection: body height = ${postFixHeight}px`);
 
       if (postFixHeight === 0) {
-        console.warn(`[Render] Body still has zero height after CSS injection — content may still be invisible`);
+        console.warn(`[Render] Body still has zero height after CSS injection`);
+        // Try to find the actual content dimensions from page-container or .pf elements
+        const contentDims = await page.evaluate(() => {
+          const pc = document.getElementById('page-container');
+          if (pc) {
+            const rect = pc.getBoundingClientRect();
+            if (rect.height > 0) return { width: rect.width, height: rect.height, source: 'page-container' };
+          }
+          // Check total height of all .pf pages
+          const pages = document.querySelectorAll('.pf');
+          if (pages.length > 0) {
+            let totalH = 0;
+            let maxW = 0;
+            pages.forEach(p => {
+              const r = p.getBoundingClientRect();
+              totalH += r.height;
+              if (r.width > maxW) maxW = r.width;
+            });
+            if (totalH > 0) return { width: maxW, height: totalH, source: 'pf-pages' };
+          }
+          // Last resort: check any element with substantial dimensions
+          const all = document.querySelectorAll('body *');
+          let maxBottom = 0;
+          let maxRight = 0;
+          for (const el of all) {
+            const r = el.getBoundingClientRect();
+            if (r.bottom > maxBottom) maxBottom = r.bottom;
+            if (r.right > maxRight) maxRight = r.right;
+          }
+          if (maxBottom > 0) return { width: maxRight, height: maxBottom, source: 'all-elements' };
+          return null;
+        }).catch(() => null);
+
+        if (contentDims) {
+          console.log(`[Render] Found content via ${contentDims.source}: ${Math.round(contentDims.width)}x${Math.round(contentDims.height)}px`);
+          // Set viewport to match content so screenshot captures it
+          await page.setViewport({
+            width: Math.max(1280, Math.ceil(contentDims.width)),
+            height: Math.max(1024, Math.ceil(contentDims.height)),
+          });
+          await new Promise((r) => setTimeout(r, 500));
+        } else {
+          console.warn(`[Render] Could not find any visible content dimensions`);
+        }
       }
     }
 
@@ -588,30 +656,51 @@ async function renderHtmlToPdf(s3HtmlUrl, options = {}) {
       }
     }
 
-    // Detect page count from pdf2htmlEX format
+    // Detect page count from HTML content
     const pageCount = await page.evaluate(() => {
       // pdf2htmlEX uses .pf class for pages
       const pfPages = document.querySelectorAll('.pf');
       if (pfPages.length > 0) return pfPages.length;
       // Also check data-page-no attribute
       const dataPages = document.querySelectorAll('[data-page-no]');
-      return dataPages.length > 0 ? dataPages.length : 0;
+      if (dataPages.length > 0) return dataPages.length;
+      // For generic HTML, check if body has visible content
+      const bodyHeight = document.body.scrollHeight;
+      if (bodyHeight > 100) return 1; // At least 1 page of content
+      return 0;
     }).catch(() => 0);
 
     const renderTimeMs = Date.now() - startTime;
     console.log(`[Render] PDF generated: ${(pdfBuffer.length / 1_000_000).toFixed(1)}MB, ${pageCount} pages, ${renderTimeMs}ms${usedFallback ? " (fallback)" : ""}`);
 
     // ── Blank PDF detection ──────────────────────────────────────────────
-    // If the PDF is suspiciously small (< 10KB) and we detected pages in the HTML,
-    // the rendering likely failed silently. Try screenshot-based fallback.
+    // If the PDF is suspiciously small (< 10KB), the rendering likely failed
+    // silently. Try screenshot-based fallback regardless of detected page count,
+    // because some formats (pdf2htmlEX with absolute positioning) may report 0 pages
+    // even though content exists.
     const MIN_VALID_PDF_SIZE = 10_000; // 10KB
-    if (pdfBuffer.length < MIN_VALID_PDF_SIZE && pageCount > 0 && !usedFallback) {
-      console.warn(`[Render] Blank PDF detected (${pdfBuffer.length} bytes but ${pageCount} pages in HTML). Trying screenshot fallback...`);
+    if (pdfBuffer.length < MIN_VALID_PDF_SIZE && !usedFallback) {
+      console.warn(`[Render] Blank PDF detected (${pdfBuffer.length} bytes, ${pageCount} pages detected). Trying screenshot fallback...`);
       try {
-        const screenshotBuffer = await page.screenshot({
+        // First try fullPage screenshot
+        let screenshotBuffer = await page.screenshot({
           fullPage: true,
           type: "png",
         });
+
+        // If fullPage screenshot is tiny (< 5KB), body height is probably 0.
+        // Fall back to viewport-sized screenshot which captures visible area.
+        if (screenshotBuffer.length < 5000) {
+          console.log(`[Render] fullPage screenshot too small (${screenshotBuffer.length} bytes), trying viewport screenshot...`);
+          // Get viewport dimensions
+          const vp = page.viewport();
+          screenshotBuffer = await page.screenshot({
+            fullPage: false,
+            type: "png",
+            clip: { x: 0, y: 0, width: vp?.width || 1280, height: vp?.height || 1024 },
+          });
+          console.log(`[Render] Viewport screenshot: ${screenshotBuffer.length} bytes`);
+        }
         const imgPage = await browser.newPage();
         try {
           const base64 = Buffer.from(screenshotBuffer).toString("base64");
