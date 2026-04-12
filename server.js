@@ -22,6 +22,13 @@
  *   BROWSER_RESTART_EVERY — Restart Chromium after N renders (default 5)
  */
 
+// Runtime Node.js version check — Blob, FormData, and fetch are globals only in Node 18+
+const [nodeMajor] = process.versions.node.split(".").map(Number);
+if (nodeMajor < 18) {
+  console.error(`[FATAL] Node.js >= 18 required (current: ${process.versions.node}). Blob, FormData, and fetch are not available in older versions.`);
+  process.exit(1);
+}
+
 const express = require("express");
 const puppeteer = require("puppeteer");
 
@@ -181,6 +188,7 @@ async function detectPageSizing(page) {
               else if (sizeVal.includes("a4")) result.pageRuleWidth = "A4";
               else if (sizeVal.includes("letter")) result.pageRuleWidth = "Letter";
               else if (sizeVal.includes("legal")) result.pageRuleWidth = "Legal";
+              else if (sizeVal.includes("tabloid") || sizeVal.includes("ledger")) result.pageRuleWidth = "Tabloid";
             }
           }
         }
@@ -379,6 +387,16 @@ async function renderHtmlToPdf(s3HtmlUrl, options = {}) {
     }
 
     console.log(`[Render] Detecting sizing...`);
+
+    // Force a layout reflow before sizing detection.
+    // After CSS injection (especially for pdf2htmlEX), the browser may not have
+    // fully recalculated layout. Reading offsetHeight forces a synchronous reflow.
+    await page.evaluate(() => {
+      // Force synchronous reflow by reading a layout property
+      void document.body.offsetHeight;
+      void document.body.scrollHeight;
+      void document.documentElement.offsetHeight;
+    });
 
     // ── Sizing detection ──────────────────────────────────────────────
     let pdfOptions = {
