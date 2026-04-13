@@ -451,6 +451,15 @@ async function renderHtmlToPdf(s3HtmlUrl, options = {}) {
             page-break-inside: avoid !important;
             margin: 0 auto !important;
             display: block !important;
+            content-visibility: visible !important;
+          }
+
+          /* Override content-visibility: auto which causes blank rendering in headless browsers */
+          [style*="content-visibility"] {
+            content-visibility: visible !important;
+          }
+          * {
+            content-visibility: visible !important;
           }
 
           /* Remove any transforms that might hide content */
@@ -489,6 +498,7 @@ async function renderHtmlToPdf(s3HtmlUrl, options = {}) {
         document.querySelectorAll('.pf').forEach(el => {
           el.style.setProperty('position', 'relative', 'important');
           el.style.setProperty('overflow', 'visible', 'important');
+          el.style.setProperty('content-visibility', 'visible', 'important');
         });
       });
 
