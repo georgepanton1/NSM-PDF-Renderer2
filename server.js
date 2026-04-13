@@ -11,6 +11,14 @@
  *
  * S3 Upload: Uses POST + multipart/form-data (matching the Forge storage API).
  *
+ * Large file handling (v4):
+ * - HEAD pre-check to determine file size before loading into Puppeteer
+ * - Files > 30MB use waitUntil: "domcontentloaded" instead of "networkidle0"
+ *   (networkidle0 waits for ALL network activity to stop, which may never happen
+ *    for huge files with many inline resources)
+ * - Pre-render memory check: if RSS is already high, restart browser first
+ * - Chromium launched with memory-conservative flags
+ *
  * Endpoints:
  *   POST /render   — Render HTML URL to PDF, upload to S3
  *   GET  /health   — Health check
@@ -39,6 +47,10 @@ const PORT = process.env.PORT || 3001;
 const RENDER_SECRET = process.env.RENDER_SECRET || "";
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || "1", 10);
 const BROWSER_RESTART_EVERY = parseInt(process.env.BROWSER_RESTART_EVERY || "5", 10);
+
+// ── Large file threshold ─────────────────────────────────────────────────────
+// Files above this size use domcontentloaded instead of networkidle0
+const LARGE_FILE_THRESHOLD = 30_000_000; // 30MB
 
 // ── Standard paper sizes (in CSS pixels at 96 DPI) ────────────────────────
 const PAPER_SIZES = {
@@ -76,7 +88,14 @@ async function getBrowser() {
       "--disable-gpu",
       "--disable-web-security",
       "--font-render-hinting=none",
-      "--js-flags=--max-old-space-size=2048",
+      "--disable-extensions",
+      "--disable-background-networking",
+      "--disable-default-apps",
+      "--disable-sync",
+      "--disable-translate",
+      "--metrics-recording-only",
+      "--no-first-run",
+      "--js-flags=--max-old-space-size=3072",
     ],
   });
 
@@ -87,6 +106,28 @@ async function getBrowser() {
 
   console.log("[Browser] Chromium launched successfully");
   return browserInstance;
+}
+
+/**
+ * Force-restart the browser to reclaim memory before a large render.
+ * Only restarts if RSS is above the threshold.
+ */
+async function ensureFreshBrowserForLargeFile() {
+  const rssMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
+  if (rssMb > 600) {
+    console.log(`[Memory] RSS ${rssMb}MB > 600MB threshold — restarting browser before large file render`);
+    if (browserInstance) {
+      await browserInstance.close().catch(() => {});
+      browserInstance = null;
+    }
+    // Force garbage collection if available
+    if (global.gc) {
+      global.gc();
+      console.log(`[Memory] Forced GC. RSS now: ${Math.round(process.memoryUsage().rss / 1024 / 1024)}MB`);
+    }
+  } else {
+    console.log(`[Memory] RSS ${rssMb}MB — OK for large file render`);
+  }
 }
 
 // ── Concurrency semaphore ───────────────────────────────────────────────────
@@ -140,6 +181,33 @@ async function uploadToS3(pdfBuffer, storageUploadUrl, storageApiKey) {
 
   const uploadResult = await uploadRes.json();
   return uploadResult;
+}
+
+// ── File size pre-check ─────────────────────────────────────────────────────
+
+/**
+ * Perform a HEAD request on the S3 URL to determine the file size.
+ * Returns the size in bytes, or null if the HEAD request fails.
+ */
+async function getFileSize(url) {
+  try {
+    const headRes = await fetch(url, {
+      method: "HEAD",
+      signal: AbortSignal.timeout(10000),
+    });
+    if (headRes.ok) {
+      const cl = headRes.headers.get("content-length");
+      if (cl) {
+        const size = parseInt(cl, 10);
+        console.log(`[Render] File size from HEAD: ${(size / 1_000_000).toFixed(1)}MB`);
+        return size;
+      }
+    }
+    return null;
+  } catch (err) {
+    console.warn(`[Render] HEAD request failed: ${err.message}`);
+    return null;
+  }
 }
 
 // ── Page sizing detection ──────────────────────────────────────────────────
@@ -261,6 +329,16 @@ async function renderHtmlToPdf(s3HtmlUrl, options = {}) {
     autoDetect = true,     // whether to auto-detect sizing from HTML content
   } = options;
 
+  // ── Step 0: Pre-check file size ────────────────────────────────────────────
+  const fileSize = await getFileSize(s3HtmlUrl);
+  const isLargeFile = fileSize && fileSize > LARGE_FILE_THRESHOLD;
+
+  if (isLargeFile) {
+    console.log(`[Render] Large file detected: ${(fileSize / 1_000_000).toFixed(0)}MB — using memory-conservative mode`);
+    // Ensure browser has enough memory headroom for large files
+    await ensureFreshBrowserForLargeFile();
+  }
+
   const browser = await getBrowser();
   const page = await browser.newPage();
   const startTime = Date.now();
@@ -270,36 +348,57 @@ async function renderHtmlToPdf(s3HtmlUrl, options = {}) {
     const vw = viewportWidth || 1280;
     await page.setViewport({ width: vw, height: 1024 });
 
-    // Block unnecessary resources to speed up loading
+    // Block unnecessary resources to speed up loading and save memory
     await page.setRequestInterception(true);
     page.on("request", (req) => {
       const type = req.resourceType();
-      if (type === "media" || type === "websocket") {
-        req.abort();
+      // For large files, also block images and fonts to reduce memory usage during initial load
+      if (isLargeFile) {
+        if (type === "media" || type === "websocket" || type === "image" || type === "font") {
+          req.abort();
+        } else {
+          req.continue();
+        }
       } else {
-        req.continue();
+        if (type === "media" || type === "websocket") {
+          req.abort();
+        } else {
+          req.continue();
+        }
       }
     });
 
     console.log(`[Render] Navigating to ${s3HtmlUrl.substring(0, 100)}...`);
 
     // Navigate to the S3-hosted HTML
+    // For large files, use "domcontentloaded" instead of "networkidle0".
+    // networkidle0 waits until there are no more than 0 network connections for 500ms,
+    // which may never happen for huge files with many inline base64 resources that
+    // trigger secondary parsing. domcontentloaded fires as soon as the HTML is parsed.
+    const waitStrategy = isLargeFile ? "domcontentloaded" : "networkidle0";
+    console.log(`[Render] Using waitUntil: "${waitStrategy}" (file ${isLargeFile ? `${(fileSize / 1_000_000).toFixed(0)}MB > ${LARGE_FILE_THRESHOLD / 1_000_000}MB threshold` : "normal size"})`);
+
     await page.goto(s3HtmlUrl, {
-      waitUntil: "networkidle0",
+      waitUntil: waitStrategy,
       timeout: timeoutMs,
     });
 
     // Wait for document to be fully ready
     await page.waitForFunction(
       () => document.readyState === "complete",
-      { timeout: 30000 }
+      { timeout: isLargeFile ? 120000 : 30000 } // 2 min for large files, 30s for normal
     );
 
-    // Small delay for any deferred JS rendering
-    await new Promise((r) => setTimeout(r, 2000));
+    // Delay for deferred JS rendering — longer for large files
+    const settleDelay = isLargeFile ? 5000 : 2000;
+    await new Promise((r) => setTimeout(r, settleDelay));
 
     const loadTimeMs = Date.now() - startTime;
     console.log(`[Render] Page loaded in ${loadTimeMs}ms, detecting format...`);
+
+    // Log memory after page load
+    const postLoadMem = process.memoryUsage();
+    console.log(`[Memory] After page load: Heap=${Math.round(postLoadMem.heapUsed / 1024 / 1024)}MB, RSS=${Math.round(postLoadMem.rss / 1024 / 1024)}MB`);
 
     // ── pdf2htmlEX detection and CSS injection ──────────────────────────
     // pdf2htmlEX HTML uses #page-container { position: absolute }, which means
@@ -563,6 +662,10 @@ async function renderHtmlToPdf(s3HtmlUrl, options = {}) {
     }
 
     console.log(`[Render] Generating PDF: format=${pdfOptions.format || 'custom'}, scale=${pdfOptions.scale}, margins=${JSON.stringify(pdfOptions.margin)}`);
+
+    // Log memory before PDF generation
+    const prePdfMem = process.memoryUsage();
+    console.log(`[Memory] Before PDF gen: Heap=${Math.round(prePdfMem.heapUsed / 1024 / 1024)}MB, RSS=${Math.round(prePdfMem.rss / 1024 / 1024)}MB`);
 
     // ── PDF generation with fallback for very large files ──────────────
     // Puppeteer's page.pdf() can crash with "Protocol error (Page.printToPDF):
@@ -848,6 +951,7 @@ app.listen(PORT, () => {
   console.log(`NSM PDF Renderer listening on port ${PORT}`);
   console.log(`  MAX_CONCURRENT: ${MAX_CONCURRENT}`);
   console.log(`  BROWSER_RESTART_EVERY: ${BROWSER_RESTART_EVERY}`);
+  console.log(`  LARGE_FILE_THRESHOLD: ${LARGE_FILE_THRESHOLD / 1_000_000}MB`);
   console.log(`  Auth: ${RENDER_SECRET ? "enabled" : "disabled (dev mode)"}`);
 
   // Pre-launch browser so first request is fast
