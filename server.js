@@ -368,17 +368,44 @@ async function renderHtmlToPdf(s3HtmlUrl, options = {}) {
       }
     });
 
-    console.log(`[Render] Navigating to ${s3HtmlUrl.substring(0, 100)}...`);
+    console.log(`[Render] Fetching HTML from ${s3HtmlUrl.substring(0, 100)}...`);
 
-    // Navigate to the S3-hosted HTML
-    // For large files, use "domcontentloaded" instead of "networkidle0".
-    // networkidle0 waits until there are no more than 0 network connections for 500ms,
-    // which may never happen for huge files with many inline base64 resources that
-    // trigger secondary parsing. domcontentloaded fires as soon as the HTML is parsed.
+    // ── Pre-fetch and sanitize HTML ──────────────────────────────────────────
+    // Instead of page.goto(url), we fetch the HTML, sanitize XHTML→HTML5 issues,
+    // then load via page.setContent(). This fixes self-closing non-void elements
+    // like <title /> that cause Chromium to swallow the entire <body> content.
+    let htmlContent;
+    try {
+      const fetchRes = await fetch(s3HtmlUrl, { signal: AbortSignal.timeout(120000) });
+      if (!fetchRes.ok) throw new Error(`HTTP ${fetchRes.status}`);
+      htmlContent = await fetchRes.text();
+      console.log(`[Render] Fetched HTML: ${(htmlContent.length / 1_000_000).toFixed(1)}MB`);
+    } catch (fetchErr) {
+      console.error(`[Render] Failed to fetch HTML: ${fetchErr.message}`);
+      throw fetchErr;
+    }
+
+    // Sanitize XHTML→HTML5: fix self-closing non-void elements that break Chromium parsing
+    const originalLen = htmlContent.length;
+    // Fix self-closing non-void elements: <title /> → <title></title>
+    htmlContent = htmlContent.replace(/<(title|style|script|div|span|p|a|textarea|iframe|noscript|section|article|aside|header|footer|nav|main)\s*\/>/gi, '<$1></$1>');
+    // Also handle self-closing with attributes: <title class="x" />
+    htmlContent = htmlContent.replace(/<(title|style|script|div|span|p|a|textarea|iframe|noscript|section)([^>]*?)\s*\/>/gi, '<$1$2></$1>');
+    // Remove XML declaration
+    htmlContent = htmlContent.replace(/<\?xml[^?]*\?>/gi, '');
+    // Remove XHTML namespace
+    htmlContent = htmlContent.replace(/(<html[^>]*)\s+xmlns="[^"]*"/gi, '$1');
+    // Remove content-visibility: auto
+    htmlContent = htmlContent.replace(/content-visibility\s*:\s*auto\s*;?/gi, '');
+    if (htmlContent.length !== originalLen) {
+      console.log(`[Render] Sanitized XHTML→HTML5 (${originalLen - htmlContent.length} bytes of XHTML artifacts removed)`);
+    }
+
+    // Load sanitized HTML via setContent instead of goto
     const waitStrategy = isLargeFile ? "domcontentloaded" : "networkidle0";
-    console.log(`[Render] Using waitUntil: "${waitStrategy}" (file ${isLargeFile ? `${(fileSize / 1_000_000).toFixed(0)}MB > ${LARGE_FILE_THRESHOLD / 1_000_000}MB threshold` : "normal size"})`);
+    console.log(`[Render] Loading sanitized HTML via setContent (waitUntil: "${waitStrategy}")`);
 
-    await page.goto(s3HtmlUrl, {
+    await page.setContent(htmlContent, {
       waitUntil: waitStrategy,
       timeout: timeoutMs,
     });
